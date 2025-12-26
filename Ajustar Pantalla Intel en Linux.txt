@@ -1,0 +1,261 @@
+﻿Análisis Técnico Exhaustivo sobre la Gestión Colorimétrica y Ajuste de Saturación en Arquitecturas Híbridas Intel/NVIDIA bajo Linux (EndeavourOS)
+Resumen Ejecutivo
+La manipulación de los parámetros de visualización, específicamente la saturación (a menudo referida comercialmente como "Digital Vibrance" por NVIDIA o "Saturation" por Intel), el contraste y la corrección gamma, representa uno de los desafíos técnicos más persistentes en la migración de usuarios avanzados desde entornos Windows hacia el ecosistema Linux. Este desafío se exacerba significativamente en hardware de arquitectura híbrida, como el ordenador portátil Dell G15 5511, el cual implementa una topología de gráficos conmutables (NVIDIA Optimus) donde el procesador gráfico integrado (iGPU) Intel Tiger Lake gestiona la señal de video del panel interno, mientras que una GPU discreta NVIDIA RTX serie 30 gestiona el renderizado de alto rendimiento y, frecuentemente, las salidas de video externas.
+Para un usuario de EndeavourOS —una distribución rolling release basada en Arch Linux— la ausencia de una interfaz gráfica unificada y monolítica como el "Intel Graphics Command Center" de Windows obliga a una interacción directa con el subsistema gráfico del kernel Linux. La investigación revela que, aunque la interfaz de usuario estándar carece de controles deslizantes simples, el hardware subyacente de Intel (Gen 9.5 y posteriores, incluyendo la arquitectura Xe presente en el G15 5511) posee capacidades completas de transformación de color mediante hardware de función fija. Específicamente, la Matriz de Transformación de Color (CTM) expuesta por el controlador i915 a través de la API DRM (Direct Rendering Manager) permite manipulaciones matemáticas precisas del espacio de color RGB antes de la etapa de corrección gamma.1
+Este informe técnico desglosa los mecanismos matemáticos y de software necesarios para replicar la "vibrancia digital" en Linux. Se analiza la dicotomía entre los servidores gráficos X11 y Wayland, demostrando que mientras X11 ofrece una maleabilidad madura a través de extensiones como RandR, Wayland introduce un paradigma de seguridad y gestión de color que requiere enfoques radicalmente diferentes, dependiendo del compositor (KWin vs Mutter). Se proporcionan soluciones prescriptivas para el usuario del Dell G15 5511, abarcando desde la inyección de matrices CTM mediante scripts en el shell hasta la configuración de perfiles de color en entornos de escritorio modernos como KDE Plasma 6.4
+1. Arquitectura del Subsistema Gráfico en Linux y Hardware Dell G15
+Para comprender la raíz del problema de la falta de controles de saturación accesibles, es imperativo diseccionar la arquitectura del subsistema de visualización en Linux y cómo este interactúa con la topología específica del hardware Dell G15 5511. A diferencia de Windows, donde los controladores gráficos abarcan tanto la ejecución del kernel como la interfaz de usuario, en Linux existe una separación estricta entre el espacio del kernel (donde residen los controladores i915 y nvidia) y el espacio de usuario (donde operan los servidores gráficos y los entornos de escritorio).
+1.1 Topología de Hardware: El Reto de los Gráficos Híbridos
+El Dell G15 5511 está equipado con una CPU Intel Core de 11ª generación (Tiger Lake), la cual integra gráficos Intel UHD o Iris Xe, y una GPU discreta NVIDIA GeForce RTX (3050, 3050 Ti, o 3060). La gestión de las salidas de video en este dispositivo sigue una configuración Optimus moderna pero compleja.
+Según los datos técnicos recopilados, el panel interno del portátil (eDP o Embedded DisplayPort) está conectado físicamente al controlador de pantalla de la iGPU Intel. Esto es un hecho inmutable en la mayoría de las configuraciones de portátiles para maximizar la eficiencia energética: incluso cuando la GPU NVIDIA renderiza un videojuego, esta debe copiar el fotograma terminado (framebuffer) a la memoria de video de la GPU Intel para que esta última lo envíe al panel. Por lo tanto, cualquier ajuste de color, saturación o gamma en la pantalla interna debe ser procesado por el controlador de visualización de Intel, no por el de NVIDIA.6
+Por el contrario, las salidas externas como HDMI o DisplayPort a través de USB-C/Thunderbolt en el G15 5511 suelen estar cableadas directamente a la GPU NVIDIA. Esto crea una bifurcación en la gestión del color:
+* Pantalla Interna (eDP): Controlada por el driver i915 (Intel). Requiere manipulación de propiedades DRM/KMS de Intel.
+* Monitor Externo (HDMI): Controlado por el driver nvidia (proprietario). Permite el uso de nvidia-settings para ajustar "Digital Vibrance" directamente, ya que NVIDIA controla el pipeline de visualización completo para ese puerto.9
+Esta distinción es crítica: el usuario no puede usar el panel de control de NVIDIA para cambiar la saturación de la pantalla del portátil porque el hardware de NVIDIA no está generando la señal de video final para esa pantalla; simplemente está pasando datos a Intel.
+1.2 El Controlador i915 y el Pipeline de Visualización
+El controlador del kernel para gráficos Intel, i915, implementa la API KMS (Kernel Mode Setting). Dentro del pipeline de visualización de hardware de Intel (el hardware físico encargado de convertir los datos de píxeles en señales eléctricas para el panel), existen bloques de función fija dedicados al color.
+El flujo de datos simplificado es el siguiente:
+1. Plane Fetch: Se leen los datos de píxeles de la memoria.
+2. Pipe Color Correction: Aquí es donde reside la magia. El hardware Intel moderno incluye una unidad CTM (Color Transformation Matrix).
+3. Gamma/DeGamma LUT: Tablas de búsqueda para corrección gamma.
+4. Port: Salida al conector eDP.
+La CTM es una matriz de $3 \times 3$ que permite mezclar los canales de color. Es matemáticamente capaz de realizar operaciones de saturación, rotación de matiz (hue), y conversión a escala de grises con un coste de rendimiento nulo para la CPU o la GPU 3D, ya que ocurre durante el "scanout".2 El problema en Linux no es la falta de soporte de hardware, sino la falta de exposición de esta matriz en herramientas gráficas fáciles de usar por defecto en distribuciones como EndeavourOS.
+2. Fundamentos Matemáticos de la Transformación de Color
+Para ajustar la saturación en la pantalla interna del Dell G15 5511 bajo Linux, debemos recurrir a la manipulación directa de la matriz CTM, ya que Intel no proporciona una herramienta GUI oficial. Comprender la matemática subyacente es esencial para utilizar correctamente herramientas como xrandr o scripts personalizados.
+2.1 La Matriz de Transformación de Color (CTM)
+En el contexto de xrandr y el driver DRM de Intel, la CTM se define como una operación lineal sobre el vector de color de cada píxel. Si representamos un píxel como un vector columna $P = \begin{bmatrix} R \\ G \\ B \end{bmatrix}$, la operación de transformación es:
+
+
+$$P' = M \times P$$
+Donde $P'$ es el nuevo color y $M$ es la matriz de transformación de $3 \times 3$:
+
+
+$$M = \begin{bmatrix} c_{rr} & c_{rg} & c_{rb} \\ c_{gr} & c_{gg} & c_{gb} \\ c_{br} & c_{bg} & c_{bb} \end{bmatrix}$$
+Una Matriz Identidad (que no altera la imagen) tiene valores de 1 en la diagonal principal y 0 en el resto:
+
+
+$$I = \begin{bmatrix} 1 & 0 & 0 \\ 0 & 1 & 0 \\ 0 & 0 & 1 \end{bmatrix}$$
+2.2 Derivación de la Fórmula de Saturación
+La saturación se define perceptualmente como la intensidad de un color en relación con su propia luminosidad. Para alterar la saturación matemáticamente, interpolamos entre la imagen original y una versión en escala de grises de la misma imagen.10
+1. Escala de Grises (Luminancia): Para convertir un color RGB a su valor de luminancia ($Y$), utilizamos coeficientes que reflejan la sensibilidad del ojo humano. Los estándares Rec. 709 (utilizados en monitores sRGB/HD) definen estos coeficientes como 11:
+   * $W_r = 0.2126$ (Peso del Rojo)
+   * $W_g = 0.7152$ (Peso del Verde)
+   * $W_b = 0.0722$ (Peso del Azul)
+La matriz que convierte cualquier color a gris ($M_{gray}$) es:$$M_{gray} = \begin{bmatrix} 0.2126 & 0.7152 & 0.0722 \\ 0.2126 & 0.7152 & 0.0722 \\ 0.2126 & 0.7152 & 0.0722 \end{bmatrix}$$
+2. Interpolación de Saturación: Definimos un factor de saturación $S$.
+   * $S = 1.0$: Saturación original (Identidad).
+   * $S = 0.0$: Escala de grises completa (Desaturado).
+   * $S > 1.0$: Colores más vivos (Saturación aumentada).
+La fórmula para la matriz de saturación $M_{sat}$ es una combinación lineal:$$M_{sat} = (1 - S) \cdot M_{gray} + S \cdot I$$Desarrollando esta ecuación para cada componente de la matriz, obtenemos los valores que debemos inyectar en el controlador de Intel:Fila 1 (Rojo):
+   * $c_{rr} = (1-S) \cdot 0.2126 + S$
+   * $c_{rg} = (1-S) \cdot 0.7152$
+   * $c_{rb} = (1-S) \cdot 0.0722$
+Fila 2 (Verde):
+   * $c_{gr} = (1-S) \cdot 0.2126$
+   * $c_{gg} = (1-S) \cdot 0.7152 + S$
+   * $c_{gb} = (1-S) \cdot 0.0722$
+Fila 3 (Azul):
+   * $c_{br} = (1-S) \cdot 0.2126$
+   * $c_{bg} = (1-S) \cdot 0.7152$
+   * $c_{bb} = (1-S) \cdot 0.0722 + S$
+2.3 Ejemplo Práctico: Aumentar la Saturación un 50%
+Si el usuario desea un aumento significativo de color (similar a un "Digital Vibrance" alto), podríamos usar $S = 1.5$.
+* Diagonal (Rojo): $(1 - 1.5) \cdot 0.2126 + 1.5 = (-0.5 \cdot 0.2126) + 1.5 = -0.1063 + 1.5 = 1.3937$
+* Fuera de diagonal (Verde en fila Rojo): $(-0.5) \cdot 0.7152 = -0.3576$
+Esta matemática confirma que para aumentar la saturación, debemos aumentar el valor del canal propio (diagonal > 1) y sustraer información de los otros canales (fuera de diagonal < 0), creando una mayor separación entre los vectores de color.2
+3. Estrategias de Implementación en EndeavourOS (X11)
+EndeavourOS permite al usuario elegir entre sesiones X11 y Wayland. Para usuarios con hardware híbrido Intel/NVIDIA que buscan control de saturación, X11 sigue siendo la plataforma más madura y flexible debido a la exposición directa de las propiedades RandR.
+3.1 Uso de vibrant-cli (Método Recomendado)
+La comunidad de código abierto ha encapsulado la complejidad matemática descrita anteriormente en herramientas fáciles de usar. La herramienta vibrant-cli (parte del proyecto libvibrant) es el estándar de facto para manipular la CTM en X11.2
+Procedimiento de Instalación y Uso en EndeavourOS:
+1. Instalación desde AUR: Dado que EndeavourOS facilita el acceso al Arch User Repository (AUR), la instalación es directa.
+Bash
+yay -S vibrant-cli
+
+O si se prefiere una interfaz gráfica (aunque menos mantenida):
+Bash
+yay -S vibrantlinux
+
+2. Identificación de la Pantalla:
+Ejecutar xrandr en la terminal para identificar el nombre de la salida interna conectada a la gráfica Intel. En el Dell G15 5511, esto suele ser eDP-1 o eDP1.
+Bash
+xrandr | grep " connected"
+# Salida esperada: eDP-1 connected primary 1920x1080...
+
+3. Ajuste de Saturación:
+El comando vibrant-cli acepta el nombre de la salida y un valor flotante donde 1.0 es neutro.
+   * Para un aumento sutil: vibrant-cli eDP-1 1.2
+   * Para alta saturación ("vibrance"): vibrant-cli eDP-1 1.5
+   * Para escala de grises: vibrant-cli eDP-1 0
+Este método es persistente solo durante la sesión actual. Para hacerlo permanente, el usuario debe añadir el comando al script de inicio de su entorno de escritorio (por ejemplo, en .xinitrc o en "Aplicaciones al inicio" de KDE/GNOME).
+3.2 Manipulación Manual con xrandr (Método Avanzado)
+Si vibrant-cli fallara o si el usuario desea un control absoluto sin dependencias adicionales, se puede inyectar la matriz CTM directamente usando xrandr. Sin embargo, la sintaxis es estricta. Las implementaciones modernas de xrandr aceptan valores flotantes separados por comas para la propiedad CTM.2
+Script de Bash para Ajuste Manual:
+El siguiente script implementa la lógica matemática de la Sección 2.2 para aplicar cualquier nivel de saturación.
+
+
+Bash
+
+
+
+
+#!/bin/bash
+# Uso:./saturate.sh
+# Ejemplo:./saturate.sh eDP-1 1.3
+
+OUTPUT="$1"
+SAT="$2"
+
+# Coeficientes Rec. 709
+RW=0.2126
+GW=0.7152
+BW=0.0722
+
+# Calcular elementos de la matriz
+# R_R = (1-S)*RW + S
+R_R=$(echo "(1-$SAT)*$RW + $SAT" | bc -l)
+R_G=$(echo "(1-$SAT)*$GW" | bc -l)
+R_B=$(echo "(1-$SAT)*$BW" | bc -l)
+
+G_R=$(echo "(1-$SAT)*$RW" | bc -l)
+G_G=$(echo "(1-$SAT)*$GW + $SAT" | bc -l)
+G_B=$(echo "(1-$SAT)*$BW" | bc -l)
+
+B_R=$(echo "(1-$SAT)*$RW" | bc -l)
+B_G=$(echo "(1-$SAT)*$GW" | bc -l)
+B_B=$(echo "(1-$SAT)*$BW + $SAT" | bc -l)
+
+# Formatear matriz para xrandr (CTM espera: r,g,b, r,g,b, r,g,b)
+CTM="$R_R,$R_G,$R_B,$G_R,$G_G,$G_B,$B_R,$B_G,$B_B"
+
+echo "Aplicando CTM a $OUTPUT con saturación $SAT..."
+xrandr --output "$OUTPUT" --set CTM "$CTM"
+
+Este script es una solución poderosa para usuarios de EndeavourOS, ya que no depende de paquetes externos más allá de bc (calculadora básica) y xorg-xrandr.
+3.3 Ajuste de Contraste y Gamma
+Mientras que la saturación se maneja vía CTM, el contraste se gestiona mejor a través de las tablas gamma. El comando xgamma o el flag --gamma de xrandr son las herramientas estándar.15
+   * Comando: xrandr --output eDP-1 --gamma 0.9:0.9:0.9
+   * Valores < 1.0 (ej. 0.9): Aumentan el contraste percibido oscureciendo los tonos medios.
+   * Valores > 1.0 (ej. 1.1): Aclaran los tonos medios, reduciendo el contraste percibido ("imagen lavada").
+La combinación de un aumento de saturación (CTM 1.2) con un ligero ajuste de gamma (0.9) suele replicar fielmente la estética "vibrante" que los usuarios buscan en Windows.
+4. Estrategias de Implementación en EndeavourOS (Wayland)
+La transición a Wayland representa un cambio de paradigma que complica significativamente la manipulación global del color. En Wayland, no existe una API global equivalente a X11 RandR que permita a una aplicación externa (como vibrant-cli) modificar el pipeline de renderizado de todas las demás aplicaciones. El control del color es responsabilidad exclusiva del compositor (KWin en KDE, Mutter en GNOME).16
+4.1 KDE Plasma 6: La Solución Nativa
+Si el usuario de EndeavourOS utiliza KDE Plasma 6 (el entorno de escritorio predeterminado o recomendado para muchas configuraciones modernas), la situación ha mejorado drásticamente. Plasma 6 introduce gestión de color avanzada y soporte HDR que, paradójicamente, habilita los controles de saturación que faltaban.4
+Característica: "SDR Color Intensity" (Intensidad de Color SDR)
+Esta función está diseñada para mapear contenido sRGB estándar dentro de un espacio de color más amplio o simplemente para saturar la imagen.
+   * Ubicación: Preferencias del Sistema -> Pantalla y Monitor -> Configuración de Pantalla.
+   * Requisito: A menudo, esta opción se vuelve visible o efectiva cuando se habilita el modo HDR, o si el monitor reporta un gamut de color amplio. En pantallas de portátiles estándar (sRGB), la disponibilidad de esta opción puede depender de la versión específica de KWin y del soporte del kernel para la gestión de color del hardware Intel.
+   * Funcionamiento: Al deslizar este control hacia la derecha, el compositor KWin aplica internamente una matriz de saturación similar a la descrita en la sección 2, pero lo hace en la etapa de composición, garantizando compatibilidad con Wayland.
+Perfilado de Color (ICC):
+KDE Plasma en Wayland soporta la carga de perfiles ICC por pantalla. Un usuario avanzado puede generar un perfil ICC sintético que fuerce una mayor saturación y cargarlo en la configuración de pantalla. Aunque esto es más complejo que un control deslizante, es una solución técnicamente viable si la opción "SDR Color Intensity" no está expuesta para el panel específico del G15.5
+4.2 GNOME en Wayland
+GNOME (Mutter) ha sido históricamente más restrictivo, priorizando la precisión del color sobre la personalización subjetiva. Sin embargo, la arquitectura de extensiones permite inyectar shaders en el pipeline de composición.
+Extensión: "Saturation Extension" / "Extended Color Management"
+Existen extensiones en el ecosistema GNOME Shell que inyectan un shader GLSL para alterar la saturación de toda la pantalla.21
+   * Limitaciones: Estas extensiones dependen de APIs internas de GNOME Shell que cambian con frecuencia. Una actualización de GNOME 45 a 46 en EndeavourOS (que actualiza paquetes muy rápido) podría romper la extensión. Además, el uso de shaders globales puede tener un impacto en el rendimiento superior al uso de la CTM de hardware de Intel.
+4.3 La Opción "Broadcast RGB" para Pantallas Externas
+Un problema común en gráficas Intel conectadas por HDMI (incluso a través del enrutamiento interno en docks USB-C) es que el driver negocia incorrectamente el rango de color, usando "Limited Range" (16-235) en lugar de "Full Range" (0-255). Esto resulta en negros grises y colores lavados, lo que el usuario puede confundir con falta de saturación.23
+Solución en X11/Wayland (si está soportado por el kernel):
+
+
+Bash
+
+
+
+
+xrandr --output HDMI-A-1 --set "Broadcast RGB" "Full"
+
+Este comando obliga al driver Intel a enviar el rango completo de color, corrigiendo instantáneamente el contraste sin necesidad de matrices complejas.
+5. Análisis Comparativo: Intel vs. NVIDIA en el G15 5511
+El Dell G15 5511 introduce la variable de la GPU NVIDIA. Es crucial diferenciar qué herramienta usar para qué puerto.
+Característica
+	Pantalla Interna (Intel)
+	Pantalla Externa (NVIDIA HDMI)
+	Driver Responsable
+	i915 (Módulo del Kernel)
+	nvidia (Propietario)
+	Control de Saturación X11
+	vibrant-cli / xrandr --set CTM
+	nvidia-settings (Digital Vibrance)
+	Control de Saturación Wayland
+	KDE Plasma "Color Intensity" / ICC
+	Depende del soporte incipiente de NVIDIA en Wayland (Driver 555+)
+	Control de Gamma
+	xrandr --gamma
+	nvidia-settings / xrandr
+	Persistencia
+	Requiere script de inicio
+	Se puede guardar en ~/.nvidia-settings-rc
+	Nota sobre Optimus: En configuraciones donde el portátil se usa en modo "Solo NVIDIA" (si la BIOS del Dell G15 permite desactivar la iGPU a través de un MUX switch), entonces la pantalla interna pasa a ser controlada por NVIDIA. En ese escenario específico, el usuario debe usar nvidia-settings para la pantalla interna también. Sin embargo, la mayoría de las configuraciones predeterminadas de portátiles "Gaming" modernos operan en modo Híbrido, manteniendo a Intel a cargo de la visualización interna.7
+6. Recomendaciones Prácticas y Flujo de Trabajo
+Basado en la investigación, se presentan las siguientes recomendaciones jerarquizadas para el usuario de EndeavourOS en un Dell G15 5511.
+6.1 Escenario A: Usuario Prioriza Control Total (Recomendado: X11)
+Si el objetivo principal es obtener colores vibrantes para juegos o multimedia y se desea estabilidad garantizada:
+   1. Iniciar sesión seleccionando "Plasma (X11)" o "GNOME (Xorg)".
+   2. Instalar vibrant-cli: yay -S vibrant-cli.
+   3. Crear un script de inicio (~/.config/autostart/color-fix.desktop) que ejecute:
+Bash
+sh -c "vibrant-cli eDP-1 1.3 && xrandr --output eDP-1 --gamma 0.9:0.9:0.9"
+
+   4. Para monitores externos HDMI, abrir nvidia-settings, ir a "Controls" y ajustar "Digital Vibrance".
+6.2 Escenario B: Usuario Moderno (Recomendado: Wayland + KDE)
+Si se prefiere las ventajas de Wayland (gestos, seguridad, fluidez):
+      1. Asegurarse de estar en KDE Plasma 6.
+      2. Ir a Preferencias -> Pantalla.
+      3. Buscar el deslizador de "Saturación" o "Intensidad de Color".
+      4. Si no aparece, verificar si habilitar HDR activa controles adicionales.
+      5. Si los controles nativos no satisfacen, considerar la generación de un perfil ICC con una curva de tono modificada usando DisplayCAL (aunque DisplayCAL funciona mejor bajo X11 para la calibración inicial, el perfil resultante .icc se puede cargar en Wayland).25
+7. Conclusión
+Ajustar la saturación y los parámetros de color en un Dell G15 5511 con gráficos Intel bajo Linux es una tarea técnicamente viable que requiere sortear la fragmentación del ecosistema. Mientras que Windows centraliza estos controles, Linux expone la potencia bruta del hardware (la matriz CTM del driver i915) permitiendo una personalización matemática precisa.
+La investigación concluye que la combinación de una sesión X11 con herramientas como vibrant-cli ofrece actualmente la solución más robusta y equivalente a Windows para la saturación de la iGPU Intel. Sin embargo, el futuro reside en los protocolos de gestión de color de Wayland, que en KDE Plasma 6 comienzan a ofrecer soluciones nativas amigables para el usuario. Para el hardware híbrido del G15, es vital reconocer qué GPU controla cada salida de video para aplicar la herramienta correcta (xrandr/CTM para Intel, nvidia-settings para NVIDIA), garantizando así una experiencia visual coherente y rica en todo el sistema.
+Apéndice: Tabla de Referencia de Coeficientes
+Para usuarios que deseen ajustar manualmente la matriz CTM, estos son los coeficientes estándar de luminancia a utilizar en las fórmulas:
+Estándar
+	R (Wr​)
+	G (Wg​)
+	B (Wb​)
+	Uso Común
+	Rec. 709
+	0.2126
+	0.7152
+	0.0722
+	HD Video, sRGB (Web/PC)
+	Rec. 601
+	0.2990
+	0.5870
+	0.1140
+	SD Video (TV antigua)
+	Rec. 2020
+	0.2627
+	0.6780
+	0.0593
+	HDR, UHD Video
+	Para propósitos de "Digital Vibrance" en escritorio, se recomienda encarecidamente utilizar los coeficientes Rec. 709.11
+Obras citadas
+      1. How to Adjust Color Settings Using the Intel® Graphics Command Center, fecha de acceso: diciembre 26, 2025, https://www.intel.com/content/www/us/en/support/articles/000058395/graphics.html
+      2. xrandr: change saturation (less color, more black/white) - Unix & Linux Stack Exchange, fecha de acceso: diciembre 26, 2025, https://unix.stackexchange.com/questions/729772/xrandr-change-saturation-less-color-more-black-white
+      3. No options for increasing visual saturation for AMD cards / Multimedia and Games / Arch Linux Forums, fecha de acceso: diciembre 26, 2025, https://bbs.archlinux.org/viewtopic.php?id=247131
+      4. What can i use to change my saturation on wayland ? : r/linux4noobs - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/linux4noobs/comments/1fz3xnf/what_can_i_use_to_change_my_saturation_on_wayland/
+      5. Working color correction in Plasma Wayland - Brainstorm - KDE Discuss, fecha de acceso: diciembre 26, 2025, https://discuss.kde.org/t/working-color-correction-in-plasma-wayland/28969
+      6. Which port connects to the Nvidia 3060 GPU? (Dell g15 5511), fecha de acceso: diciembre 26, 2025, https://www.dell.com/community/en/conversations/inspiron/which-port-connects-to-the-nvidia-3060-gpu-dell-g15-5511/67a4599ad70d260e8abbc9e0
+      7. G15 5511 3060 version thunderbolt alt mode runs from GPU? - Dell Technologies, fecha de acceso: diciembre 26, 2025, https://www.dell.com/community/en/conversations/inspiron/g15-5511-3060-version-thunderbolt-alt-mode-runs-from-gpu/65a243e11a28930dacc39a54
+      8. Dell g15 5511 external display, fecha de acceso: diciembre 26, 2025, https://www.dell.com/community/en/conversations/inspiron/dell-g15-5511-external-display/647fa0e2f4ccf8a8de5ff3e3
+      9. Dell G15 HDMI Output from Which Graphic Card : r/GamingLaptops - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/GamingLaptops/comments/w903b5/dell_g15_hdmi_output_from_which_graphic_card/
+      10. Transforming colors with matrices - lisyarus blog, fecha de acceso: diciembre 26, 2025, https://lisyarus.github.io/blog/posts/transforming-colors-with-matrices.html
+      11. Formula to determine perceived brightness of RGB color - Stack Overflow, fecha de acceso: diciembre 26, 2025, https://stackoverflow.com/questions/596216/formula-to-determine-perceived-brightness-of-rgb-color
+      12. Relative luminance - Wikipedia, fecha de acceso: diciembre 26, 2025, https://en.wikipedia.org/wiki/Relative_luminance
+      13. Rec. 709 - Wikipedia, fecha de acceso: diciembre 26, 2025, https://en.wikipedia.org/wiki/Rec._709
+      14. libvibrant/vibrantLinux: A tool to automate managing your screen's saturation depending on what programs are running - GitHub, fecha de acceso: diciembre 26, 2025, https://github.com/libvibrant/vibrantLinux
+      15. How to adjust screen settings: contrast, color saturation, etc - Ask Ubuntu, fecha de acceso: diciembre 26, 2025, https://askubuntu.com/questions/756082/how-to-adjust-screen-settings-contrast-color-saturation-etc
+      16. digital vibrance on wayland? : r/archlinux - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/archlinux/comments/1gx1hir/digital_vibrance_on_wayland/
+      17. How turn up digital vibrance? : r/linux_gaming - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/linux_gaming/comments/1evn41n/how_turn_up_digital_vibrance/
+      18. Nobody talks about one of the most important 6.1 features : r/kde - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/kde/comments/1ditwz8/nobody_talks_about_one_of_the_most_important_61/
+      19. An update on HDR and color management in KWin - Xaver's blog, fecha de acceso: diciembre 26, 2025, https://zamundaaa.github.io/wayland/2023/12/18/update-on-hdr-and-colormanagement-in-plasma.html
+      20. [Plasma6] Questions about monitor handling on Wayland : r/kde - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/kde/comments/18jof0t/plasma6_questions_about_monitor_handling_on/
+      21. Saturation Extension - GNOME Shell Extensions, fecha de acceso: diciembre 26, 2025, https://extensions.gnome.org/extension/8148/saturation-extension/
+      22. Review "Screen Vibrancy (Saturation) Extension" version 3, fecha de acceso: diciembre 26, 2025, https://extensions.gnome.org/review/66030
+      23. Tip: enable fullcolor on intel gpus on wayland and x11 : r/linux - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/linux/comments/1eplhd5/tip_enable_fullcolor_on_intel_gpus_on_wayland_and/
+      24. xrandr -- how to find the correct RGB full spectrum output command for my system, fecha de acceso: diciembre 26, 2025, https://askubuntu.com/questions/883988/xrandr-how-to-find-the-correct-rgb-full-spectrum-output-command-for-my-system
+      25. Monitor profiles in Linux (RawTherapee, digiKam, etc.) - Software - discuss.pixls.us, fecha de acceso: diciembre 26, 2025, https://discuss.pixls.us/t/monitor-profiles-in-linux-rawtherapee-digikam-etc/24615
+      26. New to Calibration – Best Settings? - DisplayCAL, fecha de acceso: diciembre 26, 2025, https://hub.displaycal.net/forums/topic/new-to-calibration-best-settings/
