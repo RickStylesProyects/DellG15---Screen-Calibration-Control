@@ -2,7 +2,7 @@
 Type=Application
 Name=Dell G15 Color Control
 Comment=Adjust Saturation and Gamma for Dell G15
-Exec=/home/rick/Programacion/DellG15\ -\ Screen\ Calibration\ Control/start_app.sh
+Exec="/home/rick/Programacion/DellG15 - Screen Calibration Control/start_app.sh"
 Icon=preferences-desktop-display
 Terminal=true
 Categories=Settings;HardwareSettings;

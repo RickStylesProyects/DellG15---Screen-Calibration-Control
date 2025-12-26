@@ -3,8 +3,8 @@
 # Dell G15 Color Control - Installer & Launcher
 
 APP_SCRIPT="./dell_g15_color_control.py"
-DEPS_PACMAN=("python-pyqt6" "xorg-xrandr" "bc")
-DEPS_AUR=("vibrant-cli")
+DEPS_PACMAN=("python-pyqt6" "xorg-xrandr" "bc" "argyllcms" "colord")
+DEPS_AUR=("vibrant-cli" "iccxml")
 
 echo "--- Dell G15 Color Control ---"
 echo "Checking dependencies..."
@@ -24,7 +24,7 @@ install_pacman_deps() {
 # Function to check and install AUR packages
 install_aur_deps() {
     for pkg in "${DEPS_AUR[@]}"; do
-        if ! command -v "$pkg" &> /dev/null; then
+        if ! pacman -Qi "$pkg" &> /dev/null; then
             echo "Installing missing AUR package: $pkg"
             if command -v yay &> /dev/null; then
                 yay -S --noconfirm "$pkg"
@@ -32,8 +32,6 @@ install_aur_deps() {
                 paru -S --noconfirm "$pkg"
             else
                 echo "Error: Neither 'yay' nor 'paru' found. Cannot install $pkg."
-                echo "Please install $pkg manually."
-                read -p "Press Enter to continue anyway..."
             fi
         else
             echo "  [OK] $pkg"

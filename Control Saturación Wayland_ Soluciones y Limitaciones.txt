@@ -1,0 +1,322 @@
+﻿Análisis Técnico Exhaustivo de la Arquitectura de Saturación Programática en KDE Plasma bajo Wayland
+1. Introducción: El Cambio de Paradigma en la Gestión de Color y la Necesidad de Control de Bajo Nivel
+La transición del sistema de ventanas X11 al protocolo Wayland representa la reingeniería más significativa de la pila gráfica de Linux en las últimas tres décadas. Para los desarrolladores de sistemas, integradores y usuarios avanzados que históricamente dependían de la arquitectura permisiva de X11 —donde herramientas como xrandr, nvidia-settings y utilidades de terceros como vibrant-cli permitían la manipulación trivial y global de parámetros de visualización como la "Vibrancia Digital"— Wayland presenta un entorno restrictivo y centrado en la seguridad. En esta nueva arquitectura, el Compositor (en este caso, KWin) actúa como el árbitro exclusivo del contenido visual, impidiendo que aplicaciones de terceros modifiquen arbitrariamente la tubería de renderizado global.1
+Este informe técnico proporciona un examen exhaustivo de los métodos programáticos para recuperar el control de la saturación en KDE Plasma 6 ejecutándose sobre Wayland. Más allá de las configuraciones básicas de la GUI, el documento explora intervenciones de bajo nivel en la pila gráfica. Específicamente, detalla tres vectores distintos de control: la inyección de configuración directa en los archivos de persistencia de KScreen y KWin, la gestión de color sintética mediante la generación programática de perfiles ICC diseñados para la saturación (superando las limitaciones de precisión colorimétrica estándar), y la inyección de sombreadores de fragmentos GLSL (OpenGL Shading Language) personalizados en la pila de efectos de KWin. Estas metodologías buscan superar las limitaciones inherentes de la API pública de KWin, que históricamente ha carecido de controles granulares de saturación accesibles vía DBus.3
+1.1 El Vacío de Control en la Arquitectura Wayland
+Bajo X11, el servidor X permitía a los clientes establecer rampas de gamma y matrices de color a través de la extensión XRandR. Los controladores propietarios, como los de NVIDIA, exponían APIs privadas (NV-CONTROL) que permitían ajustes de post-procesamiento en la GPU antes de que la señal llegara a la pantalla.5 En Wayland, los clientes están aislados. No pueden ver ni modificar la salida de otros clientes ni la etapa de composición global. KWin, actuando como el Compositor de Wayland, posee el nodo DRM (Direct Rendering Manager) y KMS (Kernel Mode Setting).6
+La implicación directa es que solo KWin puede instruir a la GPU para alterar la salida de color final. A menos que KWin exponga una interfaz DBus o una clave de configuración específica para la saturación, los scripts externos no pueden influir en ella. Aunque versiones recientes de Plasma (6.3+) introducen controles de intensidad sRGB 7, estos a menudo se limitan a la gestión de contenido sRGB en pantallas de amplia gama cromática, dejando un vacío para los usuarios que buscan aumentar la saturación (vibrancia) más allá de los estándares colorimétricos en monitores estándar.8 Por lo tanto, se requiere un enfoque que manipule los archivos internos y la tubería de sombreado.
+________________
+2. Vector A: Manipulación Directa de la Configuración (kwinrc y KScreen)
+El método más directo, aunque a menudo ignorado por requerir ingeniería inversa de formatos de archivo no documentados, implica la modificación de los archivos de configuración que KWin y KScreen leen durante su inicialización o reconfiguración. Este enfoque evita las limitaciones de la interfaz gráfica de usuario y permite la automatización mediante scripts.
+2.1 Arquitectura de Persistencia de KScreen
+KScreen es el subsistema responsable de la configuración de la pantalla (resolución, frecuencia de actualización, orientación y asignación de perfiles de color). A diferencia del estático xorg.conf de X11, KScreen mantiene una base de datos dinámica de pantallas conectadas identificadas por hashes generados a partir de sus datos EDID (Extended Display Identification Data).
+2.1.1 Estructura y Ubicación de los Archivos Hash
+Las configuraciones se almacenan en formato JSON dentro del directorio ~/.local/share/kscreen/.9 Cada archivo corresponde a una configuración de hardware específica (un conjunto de monitores conectados). La ruta típica sigue el patrón ~/.local/share/kscreen/{hash_del_edid}. Un análisis de la estructura interna revela claves críticas para la inyección de perfiles de color.11
+
+
+JSON
+
+
+
+
+{
+   "id": "eDP-1",
+   "metadata": {
+       "name": "eDP-1",
+       "fullname": "Color LCD"
+   },
+   "mode": {
+       "refresh": 60000,
+       "size": {
+           "height": 1080,
+           "width": 1920
+       }
+   },
+   "scale": 1,
+   "colorProfileSource": "ICC",
+   "iccProfile": "/home/user/.local/share/icc/custom_saturation.icc"
+}
+
+La clave colorProfileSource debe establecerse explícitamente en "ICC" para forzar al compositor a ignorar los datos sRGB predeterminados o los datos EDID brutos y cargar un archivo de perfil específico.11 La clave iccProfile define la ruta absoluta al perfil.
+2.1.2 Estrategia de Inyección Programática
+Para forzar un cambio de saturación a través de este vector, no establecemos una variable de "saturación" directamente (ya que tal clave no existe en el esquema JSON de KScreen para la saturación global). En su lugar, apuntamos la clave iccProfile a un perfil personalizado (cuya generación se detalla en el Capítulo 4). Dado que kscreen-doctor a veces falla en la aplicación instantánea o en el reconocimiento de dispositivos en ciertos entornos Wayland 12, la edición directa del JSON es un mecanismo de respaldo robusto.
+El siguiente algoritmo describe la lógica necesaria para un script de inyección:
+1. Identificación: Escanear ~/.local/share/kscreen/ para encontrar el archivo JSON modificado más recientemente (que corresponde a la configuración de pantalla activa).
+2. Análisis: Cargar el JSON y recorrer la lista de salidas (outputs).
+3. Inyección: Para cada salida conectada ("connected": true), modificar colorProfileSource a ICC y actualizar iccProfile con la ruta del perfil saturado generado.
+4. Persistencia: Escribir el JSON de forma atómica (escribir en temporal y renombrar) para evitar condiciones de carrera.
+5. Recarga: Forzar a KWin/KScreen a recargar la configuración. Esto se puede lograr mediante kscreen-doctor --dpms off seguido de on, o mediante llamadas DBus para reconfigurar el backend de KWin.13
+2.2 Manipulación de kwinrc y Claves Ocultas
+Además de KScreen, el archivo ~/.config/kwinrc controla el comportamiento del compositor. Las investigaciones recientes indican que ciertas claves relacionadas con la intensidad sRGB se han introducido en las secciones [Compositing] o [NightColor] en las versiones más nuevas de Plasma.7
+2.2.1 Interfaz de Línea de Comandos kwriteconfig6
+Para modificar estas configuraciones sin editar archivos de texto manualmente y arriesgarse a corrupciones de sintaxis, se debe utilizar la herramienta kwriteconfig6 (o kwriteconfig5 en sistemas más antiguos). Esta herramienta asegura que los cambios sean notificados al demonio de configuración de KDE.16
+Comando para inyección de intensidad sRGB (Plasma 6.3+):
+
+
+Bash
+
+
+
+
+kwriteconfig6 --file kwinrc --group Compositing --key SrgbIntensity 1.0
+qdbus6 org.kde.KWin /KWin reconfigure
+
+Este comando establece la intensidad al máximo. Sin embargo, como se detalla en los fragmentos de investigación, esta configuración a menudo controla el mapeo de tono (tone mapping) de contenido sRGB en pantallas HDR o de amplia gama, y puede no tener efecto en monitores sRGB estándar donde la gestión de color se desactiva por defecto para ahorrar rendimiento.18 Aquí es donde la inyección de shaders se vuelve obligatoria.
+________________
+3. Vector B: Inyección de Shaders GLSL en la Tubería de Composición
+Este método proporciona el control más granular y potente, permitiendo ajustes en tiempo real y mimetizando la lógica de la "Vibrancia Digital" mediante matemáticas de píxeles. KWin permite cargar "Efectos" como complementos, que pueden interceptar la textura de una ventana o de la pantalla completa y aplicar un sombreado de fragmentos (fragment shader) antes de la salida.19
+3.1 Arquitectura de Efectos de KWin y GLSL
+La tubería de renderizado de KWin 6 utiliza OpenGL (y experimentalmente Vulkan). Un efecto programable se sitúa en la cadena de composición. El objetivo es interceptar el búfer de imagen y aplicar una transformación de matriz de color.
+El lenguaje utilizado es GLSL (OpenGL Shading Language). Para manipular la saturación, debemos convertir el espacio de color RGB a un espacio que separe la luminancia de la crominancia (como HSV, HSL o simplemente calculando la Luma) y luego manipular la intensidad del vector de color.
+3.1.1 Fundamentos Matemáticos del Shader de Saturación
+La fórmula estándar para la saturación basada en luminancia, que es computacionalmente eficiente para un compositor de tiempo real, implica los siguientes pasos 20:
+1. Cálculo de Luma: Se utiliza el producto punto del color RGB con los coeficientes de luminancia estándar (Rec. 709 para HD/sRGB).
+
+$$L = 0.2126 \cdot R + 0.7152 \cdot G + 0.0722 \cdot B$$
+2. Interpolación (Mix): Se realiza una interpolación lineal entre el valor de gris (Luma) y el color original.
+
+$$Color_{salida} = \text{mix}(\vec{3}(L), Color_{entrada}, FactorSaturación)$$
+   * Si $FactorSaturación > 1.0$, el vector de color se extiende más allá de su magnitud original alejándose del gris, resultando en un aumento de saturación.
+   * Si $FactorSaturación < 1.0$, el color se acerca al gris (desaturación).
+3.2 Implementación Práctica con kwin-effect-shaders
+En lugar de compilar un efecto C++ desde cero, la comunidad ha desarrollado cargadores de shaders genéricos. El más destacado es kwin-effect-shaders mantenido por Kevinlekiller.22 Este proyecto actúa como un contenedor que permite inyectar código GLSL arbitrario en KWin sin recompilar el compositor.
+3.2.1 Despliegue Programático
+Para implementar esto en una solución automatizada, se debe seguir el siguiente flujo de trabajo, superando la necesidad de interacción con la GUI:
+   1. Instalación: Desplegar el paquete kwin-effect-shaders-git (disponible en AUR para distribuciones basadas en Arch, o compilable desde el código fuente para otras).23
+   2. Ubicación de los Shaders: Los shaders activos residen típicamente en ~/.local/share/kwin-effect-shaders_shaders/. El archivo principal de configuración del shader suele nombrarse 1_settings.glsl o similar, dependiendo de la versión.22
+   3. Inyección del Código GLSL:
+Se debe sobrescribir el archivo de fragmentos (.frag) con el código personalizado de vibrancia. El repositorio de Kevinlekiller incluye un archivo Vibrance.frag 24, pero para un control total, podemos inyectar nuestro propio código optimizado.
+Código GLSL de Saturación (Vibrancia) Optimizado:
+
+
+OpenGL Shading Language
+
+
+
+
+#version 140
+// KWin requiere versión 140 para perfiles core
+uniform sampler2D sampler; // La textura de la ventana/pantalla
+uniform float opacity;     // Uniforme estándar de KWin
+uniform float saturation;  // Nuestro uniforme personalizado (e.g., 1.5 para +50%)
+
+in vec2 texcoord;          // Coordenadas de textura
+out vec4 fragColor;        // Salida de color
+
+// Coeficientes Luma Rec. 709
+const vec3 lumaCoef = vec3(0.2126, 0.7152, 0.0722);
+
+void main() {
+   vec4 tex = texture(sampler, texcoord);
+   
+   // 1. Calcular Luma
+   float luma = dot(tex.rgb, lumaCoef);
+   vec3 gray = vec3(luma);
+   
+   // 2. Aplicar Saturación
+   // La función mix interpola linealmente. Valores > 1.0 extrapolan (boost).
+   vec3 satColor = mix(gray, tex.rgb, saturation);
+   
+   // 3. Clamp para evitar desbordamiento de color (artifacts)
+   satColor = clamp(satColor, 0.0, 1.0);
+   
+   // 4. Componer con opacidad original
+   fragColor = vec4(satColor, tex.a) * opacity;
+}
+
+3.2.2 Automatización de la Configuración del Shader
+El desafío radica en pasar el valor de saturation al shader dinámicamente. kwin-effect-shaders permite definir constantes o leer uniformes si el backend lo soporta. Una técnica "sucia" pero efectiva para scripts de bash es utilizar sed para modificar directamente una constante #define en el archivo del shader y forzar una recompilación en caliente.
+Script de Control de Vibrancia (Bash):
+
+
+Bash
+
+
+
+
+#!/bin/bash
+# set_vibrance.sh
+# Uso:./set_vibrance.sh [Nivel 0.0 - 2.0]
+# 1.0 es neutral. 1.5 es vibrante.
+
+VALOR=$1
+ARCHIVO_SHADER="$HOME/.local/share/kwin-effect-shaders_shaders/1_settings.glsl"
+
+# Verificar si el archivo existe, si no, copiar plantilla
+if; then
+   echo "Inicializando shader de vibrancia..."
+   cp "$HOME/.local/share/kwin-effect-shaders_shaders/Vibrance.frag" "$ARCHIVO_SHADER"
+fi
+
+# Reemplazar el valor de saturación usando regex
+# Asumimos que el shader tiene una línea: #define VIBRANCE_LEVEL 1.0
+sed -i "s/#define VIBRANCE_LEVEL.*/#define VIBRANCE_LEVEL $VALOR/" "$ARCHIVO_SHADER"
+
+# Recargar KWin para recompilar el shader
+# Esto usa DBus para invocar el método reconfigure
+qdbus org.kde.KWin /KWin reconfigure
+
+Este método cumple con el requisito de "superar las limitaciones de la API pública" al evitar la necesidad de una API de saturación explícita, utilizando en su lugar la infraestructura de recarga de configuración de efectos genéricos.13
+________________
+4. Vector C: Gestión de Perfiles ICC Sintéticos (El Enfoque "Colorimétrico")
+Mientras que los shaders manipulan los píxeles después de ser renderizados pero antes de ser mostrados, los perfiles ICC instruyen al motor de gestión de color (CMS) sobre cómo transformar los valores de color para el dispositivo de salida. Este es el método más eficiente en términos de rendimiento, ya que la transformación suele ser manejada por la tabla de consulta de hardware (LUT) o la matriz de transformación de color (CTM) de la GPU, con un costo de rendimiento cero.18
+4.1 Teoría de la "Mentira Colorimétrica"
+Normalmente, un perfil ICC describe las características reales de un monitor para garantizar la precisión. Para aumentar la saturación programáticamente, debemos generar un perfil "sintético" que describa un monitor con una gama de colores menor que la real.
+La lógica es contraintuitiva pero sólida:
+      1. Si le decimos a KWin que el monitor tiene un rojo "débil" (desaturado), KWin intentará compensar enviando valores RGB más intensos para lograr el color deseado.
+      2. Al enviar estos valores "boosted" a un monitor que en realidad es normal, el resultado es una imagen sobresaturada.
+4.2 Generación de Perfiles con ArgyllCMS
+Utilizamos ArgyllCMS, una suite de herramientas de línea de comandos para la gestión de color, para crear estos perfiles.26 Específicamente, las herramientas txt2ti3 y colprof son esenciales. Sin embargo, para manipular puramente las matrices de color sin mediciones físicas, una herramienta más quirúrgica es iccxml (parte de LittleCMS), que permite editar perfiles como XML.
+4.2.1 Flujo de Trabajo con collink y targen
+El enfoque más avanzado dentro de ArgyllCMS es utilizar collink para crear un perfil de enlace de dispositivo (Device Link Profile) con una intención de renderizado de saturación forzada.28
+
+
+Bash
+
+
+
+
+# Crear un enlace que fuerce la saturación
+# -s: Modo simple (saturación)
+# -ip: Perfil de entrada (sRGB)
+# -op: Perfil de salida (Tu monitor actual o sRGB genérico)
+collink -v -s -ip -op /usr/share/color/icc/sRGB.icm /ruta/a/mi_monitor.icc perfil_saturado.icc
+
+Sin embargo, KWin en Wayland a menudo espera perfiles de pantalla (Display Profiles), no perfiles de enlace (Link Profiles). Por lo tanto, la generación de un perfil de matriz modificado es más compatible.
+4.2.2 Modificación de Primarios vía XML
+Este método permite una precisión matemática absoluta en la definición de la "vibrancia".
+      1. Conversión a XML: Convertir un perfil sRGB estándar a XML.
+Bash
+icc2xml /usr/share/color/icc/sRGB.icm > srgb_editable.xml
+
+      2. Edición de Matrices: Localizar las etiquetas rXYZ, gXYZ, bXYZ. Estas definen las coordenadas de los colores primarios en el espacio XYZ. Reducir la magnitud de estos vectores (acercándolos al punto blanco) simula un monitor desaturado.
+         * Ejemplo: Si el rojo sRGB tiene un X de 0.436, reducirlo a 0.350 hará que el sistema empuje el rojo con más fuerza.
+         3. Reconstrucción:
+Bash
+xml2icc srgb_editable.xml > boost_saturation.icc
+
+         4. Aplicación: Inyectar este perfil usando el método de KScreen detallado en la Sección 2.1.2 o mediante kscreen-doctor 29:
+Bash
+kscreen-doctor output.1.iccprofile."$HOME/boost_saturation.icc"
+
+________________
+5. Integración y Automatización Avanzada
+Para ofrecer una solución robusta que compita con las herramientas de Windows, es necesario integrar estos métodos en un demonio o script de control que reaccione al entorno del usuario.
+5.1 Script de "Modo Juego" (Wrapper)
+Dado que no podemos confiar en la detección automática de ventanas de juego debido al aislamiento de Wayland (a menos que usemos protocolos de accesibilidad o scripts KWin KWin), un enfoque pragmático es un "wrapper" de lanzamiento.
+Este script combina la inyección de shader y el cambio de perfil ICC para máxima eficacia:
+
+
+Bash
+
+
+
+
+#!/bin/bash
+# gamemode_vibrance.sh
+# Lanza una aplicación con saturación aumentada y restaura al salir.
+
+APP_COMMAND="$@"
+SHADER_CONF="$HOME/.local/share/kwin-effect-shaders_shaders/1_settings.glsl"
+NORMAL_ICC="$HOME/.local/share/icc/normal.icc"
+GAMING_ICC="$HOME/.local/share/icc/boost_saturation.icc"
+
+function enable_vibrance() {
+   echo "Activando Vibrancia..."
+   # 1. Cambiar Perfil ICC (Método preferido por bajo overhead)
+   kscreen-doctor output.1.iccprofile."$GAMING_ICC"
+   
+   # 2. Activar Shader (Opcional, para efectos visuales más fuertes)
+   # Modificar constante en el shader
+   sed -i 's/float saturation = 1.0;/float saturation = 1.5;/' "$SHADER_CONF"
+   qdbus org.kde.KWin /KWin reconfigure
+}
+
+function disable_vibrance() {
+   echo "Desactivando Vibrancia..."
+   kscreen-doctor output.1.iccprofile."$NORMAL_ICC"
+   sed -i 's/float saturation = 1.5;/float saturation = 1.0;/' "$SHADER_CONF"
+   qdbus org.kde.KWin /KWin reconfigure
+}
+
+# Trampa para asegurar limpieza al salir
+trap disable_vibrance EXIT
+
+enable_vibrance
+# Ejecutar el juego/app
+$APP_COMMAND
+
+5.2 Consideraciones sobre Anti-Cheat y Rendimiento
+Es crucial notar que, a diferencia de inyectores como ReShade que se enganchan en el proceso del juego (y pueden activar sistemas anti-trampas como VAC o BattlEye), las soluciones basadas en KWin (Shaders y ICC) operan estrictamente en el nivel del Compositor.31 El juego desconoce por completo que los colores están siendo modificados, ya que esto ocurre en el servidor de visualización. Esto hace que este enfoque sea seguro para juegos competitivos.
+En términos de rendimiento:
+            * ICC: Impacto nulo. La transformación es manejada por el hardware de visualización (CTM).
+            * Shaders: Impacto bajo a medio. Un shader de fragmentos simple como el descrito anteriormente consume ciclos de GPU insignificantes en hardware dedicado, pero puede aumentar el consumo de energía en iGPUs de portátiles cuando se ejecutan pantallas 4K de alta frecuencia de actualización, ya que cada píxel debe ser procesado por el shader.
+________________
+6. Conclusión y Perspectivas Futuras
+La ausencia de un control deslizante de "Saturación" en la interfaz de usuario de KDE Plasma Wayland no implica una imposibilidad técnica, sino una decisión de diseño arquitectónico que prioriza la corrección colorimétrica sobre la manipulación estética arbitraria. Sin embargo, la flexibilidad de Linux permite a los usuarios avanzados eludir estas restricciones.
+El análisis demuestra que la inyección de perfiles ICC sintéticos es la solución arquitectónicamente superior para un uso diario estable, ya que aprovecha el propio CMS de Wayland para realizar el trabajo pesado sin coste computacional. Por otro lado, la inyección de shaders GLSL mediante kwin-effect-shaders ofrece la experiencia más cercana a la "Vibrancia Digital" dinámica, permitiendo transiciones instantáneas y lógica de renderizado compleja que los perfiles ICC estáticos no pueden igualar.
+A medida que el protocolo de Gestión de Color de Wayland madure, es probable que veamos APIs nativas para la "intención de saturación". Hasta entonces, la manipulación directa de kscreen y la inyección de código GLSL en la tubería de efectos de KWin constituyen las soluciones programáticas definitivas para el control de saturación en el escritorio Linux moderno.
+Tabla Comparativa de Soluciones Programáticas
+Método
+	Vector de Control
+	Complejidad
+	Rendimiento
+	Persistencia
+	Seguridad Anti-Cheat
+	Inyección KScreen
+	JSON / ICC
+	Media
+	Excelente (Hardware)
+	Alta (Reinicios)
+	Total
+	Shaders GLSL
+	KWin Effects
+	Alta (Código GLSL)
+	Bueno (GPU Overhead)
+	Alta (Config)
+	Total
+	kwriteconfig6
+	kwinrc
+	Baja
+	Variable (Dep. Driver)
+	Alta
+	Total
+	ArgyllCMS (Link)
+	Perfil DeviceLink
+	Muy Alta
+	Excelente
+	Media
+	Total
+	Esta investigación concluye que, combinando la generación de perfiles con scripts de automatización de KScreen, es posible replicar y superar la funcionalidad perdida de X11, ofreciendo un entorno visualmente personalizado y vibrante en la era Wayland.
+Obras citadas
+            1. digital vibrance on wayland? : r/archlinux - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/archlinux/comments/1gx1hir/digital_vibrance_on_wayland/
+            2. Wayland Nvidia Digital Vibrance Control - Fedora Discussion, fecha de acceso: diciembre 26, 2025, https://discussion.fedoraproject.org/t/wayland-nvidia-digital-vibrance-control/170641
+            3. Saturation on KDE 6 - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/kde/comments/1mq68p1/saturation_on_kde_6/
+            4. How do you manually calibrate a monitor's color in Wayland? - Help - KDE Discuss, fecha de acceso: diciembre 26, 2025, https://discuss.kde.org/t/how-do-you-manually-calibrate-a-monitors-color-in-wayland/23610
+            5. How do you increase digital vibrance on KDE? : r/linux_gaming - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/linux_gaming/comments/rzhu3d/how_do_you_increase_digital_vibrance_on_kde/
+            6. HDR and color management in KWin - Xaver's blog, fecha de acceso: diciembre 26, 2025, https://zamundaaa.github.io/wayland/2023/05/18/hdr-and-color-management-in-kwin.html
+            7. Working color correction in Plasma Wayland - Brainstorm - KDE Discuss, fecha de acceso: diciembre 26, 2025, https://discuss.kde.org/t/working-color-correction-in-plasma-wayland/28969
+            8. HDR Without Gamescope Guide - FAQ and Tutorials - CachyOS Forum, fecha de acceso: diciembre 26, 2025, https://discuss.cachyos.org/t/hdr-without-gamescope-guide/8640
+            9. [SOLVED]Is there a way to reset Plasma kscreen configuration file? - Arch Linux Forums, fecha de acceso: diciembre 26, 2025, https://bbs.archlinux.org/viewtopic.php?id=254023
+            10. In which file does KDE store the display settings that are edited in System Settings - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/kde/comments/113wv1x/in_which_file_does_kde_store_the_display_settings/
+            11. libkscreen/src/doctor/doctor.cpp at master - GitHub, fecha de acceso: diciembre 26, 2025, https://github.com/KDE/libkscreen/blob/master/src/doctor/doctor.cpp
+            12. Setting ICC profile / Kernel & Hardware / Arch Linux Forums, fecha de acceso: diciembre 26, 2025, https://bbs.archlinux.org/viewtopic.php?id=296709
+            13. How to properly reload a kwin script - Help - KDE Discuss, fecha de acceso: diciembre 26, 2025, https://discuss.kde.org/t/how-to-properly-reload-a-kwin-script/4260
+            14. wayland desktop effect development - how to reload effect without restarting kwin_wayland? : r/kde - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/kde/comments/16dlsln/wayland_desktop_effect_development_how_to_reload/
+            15. Plasma 5.27.80 complete changelog - KDE Community, fecha de acceso: diciembre 26, 2025, https://kde.org/announcements/changelogs/plasma/5.27.9-5.27.80/
+            16. How to Apply Changes Made with kwriteconfig6 Without Restarting KWin? : r/kde - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/kde/comments/1fr5kq5/how_to_apply_changes_made_with_kwriteconfig6/
+            17. Tldr3 - Visual Basic for Applications Wiki, fecha de acceso: diciembre 26, 2025, https://vba.miraheze.org/wiki/Tldr3
+            18. An update on HDR and color management in KWin - Xaver's blog, fecha de acceso: diciembre 26, 2025, https://zamundaaa.github.io/wayland/2023/12/18/update-on-hdr-and-colormanagement-in-plasma.html
+            19. KWin scripting API - KDE Developer, fecha de acceso: diciembre 26, 2025, https://develop.kde.org/docs/plasma/kwin/api/
+            20. GLSL shader to boost the color - Stack Overflow, fecha de acceso: diciembre 26, 2025, https://stackoverflow.com/questions/50965644/glsl-shader-to-boost-the-color
+            21. Saturation and Hue in GLSL - OpenGL - Khronos Forums, fecha de acceso: diciembre 26, 2025, https://community.khronos.org/t/saturation-and-hue-in-glsl/53030
+            22. kevinlekiller/kwin-effect-shaders: Desktop effect for KDE Plasma to apply GLSL shaders. Alternative to vkBasalt or ReShade when they are unsupported. - GitHub, fecha de acceso: diciembre 26, 2025, https://github.com/kevinlekiller/kwin-effect-shaders
+            23. No animations and effects kde plasma arch - Unix & Linux Stack Exchange, fecha de acceso: diciembre 26, 2025, https://unix.stackexchange.com/questions/718660/no-animations-and-effects-kde-plasma-arch
+            24. kevinlekiller/kwin-effect-shaders_shaders: The GLSL shaders for https://github.com/kevinlekiller/kwin-effect-shaders - GitHub, fecha de acceso: diciembre 26, 2025, https://github.com/kevinlekiller/kwin-effect-shaders_shaders
+            25. Full Screen Color Correction Linux ICC KDE - Dmitry Safonov - Medium, fecha de acceso: diciembre 26, 2025, https://dmitry-s-safonov.medium.com/full-screen-color-correction-in-linux-f2925be58f97
+            26. Open source tools - INTERNATIONAL COLOR CONSORTIUM, fecha de acceso: diciembre 26, 2025, https://www.color.org/opensource.xalter
+            27. Argyll Documentation Top - ArgyllCMS, fecha de acceso: diciembre 26, 2025, https://www.argyllcms.com/doc/ArgyllDoc.html
+            28. link/collink - ArgyllCMS, fecha de acceso: diciembre 26, 2025, https://www.argyllcms.com/doc/collink.html
+            29. Kscreen Doctor - Dendron - TLDR, fecha de acceso: diciembre 26, 2025, https://tldr.dendron.so/notes/linux.kscreen-doctor.html
+            30. Enable and disable ICC profile from console - Help - KDE Discuss, fecha de acceso: diciembre 26, 2025, https://discuss.kde.org/t/enable-and-disable-icc-profile-from-console/35953
+            31. nVibrant - Digital Vibrance for nvidia under Wayland : r/linux_gaming - Reddit, fecha de acceso: diciembre 26, 2025, https://www.reddit.com/r/linux_gaming/comments/1jmsva0/nvibrant_digital_vibrance_for_nvidia_under_wayland/
