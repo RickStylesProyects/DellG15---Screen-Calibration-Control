@@ -318,21 +318,34 @@ class DisplayController:
                     print("DEBUG: Removing existing sampled TRC curve.")
                     tags_node.remove(curve_node)
             
-            # 3. Create new parametricCurveType
-            # <ParametricCurveType>
-            # ...
-            # </ParametricCurveType>
+            # 3. Create new curveType (Sampled LUT)
+            # ParametricCurveType caused parsing errors with installed iccxml version.
+            # Fallback to 256-point LUT (Standard sRGB style).
+            # Range: 0-65535
             
-            para_node = ET.SubElement(tags_node, "ParametricCurveType")
-            ET.SubElement(para_node, "TagSignature").text = "rTRC"
-            ET.SubElement(para_node, "TagSignature").text = "gTRC"
-            ET.SubElement(para_node, "TagSignature").text = "bTRC"
+            curve_node = ET.SubElement(tags_node, "curveType")
+            ET.SubElement(curve_node, "TagSignature").text = "rTRC"
+            ET.SubElement(curve_node, "TagSignature").text = "gTRC"
+            ET.SubElement(curve_node, "TagSignature").text = "bTRC"
             
-            curve_param = ET.SubElement(para_node, "ParametricCurve")
-            curve_param.attrib["FunctionType"] = "0" # Y = X ^ Gamma
-            ET.SubElement(curve_param, "Parameter").text = f"{target_gamma_val:.4f}"
+            # Calculate LUT
+            # Formula: Y = X ^ (2.2 / UserGamma)
+            # Standard sRGB is approx 2.2. If User Gamma=1.0, we want 2.2 results.
+            exponent = 2.2 / float(gamma)
             
-            print(f"DEBUG: Injected Parametric Gamma Curve: {target_gamma_val:.4f}")
+            lut_values = []
+            for i in range(256):
+                norm_x = i / 255.0
+                norm_y = norm_x ** exponent
+                val_int = int(norm_y * 65535.0 + 0.5)
+                val_int = max(0, min(65535, val_int)) # Clamp
+                lut_values.append(str(val_int))
+            
+            lut_str = " ".join(lut_values)
+            
+            ET.SubElement(curve_node, "Curve").text = lut_str
+            
+            print(f"DEBUG: Injected Sampled Gamma Curve (Exponent={exponent:.4f})")
 
             # Modify Header: Change Class from 'spac' (ColorSpace) to 'mntr' (Monitor)
             header = root.find("Header")
@@ -392,8 +405,8 @@ class DisplayController:
                          if f.startswith("custom_profile_") and f.endswith(".icc")]
                 files.sort(key=os.path.getmtime) # Oldest first
                 
-                # If we have more than 5, delete the oldest ones
-                while len(files) > 5:
+                # If we have more than 2, delete the oldest ones
+                while len(files) > 2:
                     oldest = files.pop(0)
                     try:
                         os.remove(oldest)
@@ -547,6 +560,15 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
+        
+        # Load Saved Settings
+        saved_settings = SettingsManager.load_settings()
+        if saved_settings:
+            saved_sat = saved_settings.get('saturation', 1.0)
+            saved_gamma = saved_settings.get('gamma', 1.0)
+            self.sat_spin.setValue(float(saved_sat))
+            self.gamma_spin.setValue(float(saved_gamma))
+            print(f"DEBUG: Loaded settings: Sat={saved_sat}, Gam={saved_gamma}")
 
     def refresh_displays(self):
         self.display_combo.clear()
